@@ -15,7 +15,11 @@ task environmentSetup(type: Exec, dependsOn: checkPythonVersion) {
   commandLine 'bash', '-c', "${python_executable} -m venv ${venv_name} && ${venv_name}/bin/python -m pip install --upgrade pip wheel setuptools==57.5.0"
 }
 
-task installPackage(type: Exec, dependsOn: environmentSetup) {
+task installPackageM1(type: Exec, dependsOn: environmentSetup) {
+  commandLine 'zsh','-c',"source ${venv_name}/bin/activate && ./scripts/m1_install_dev.sh"
+}
+
+task installPackage(type: Exec, dependsOn: installPackageM1) {
   commandLine "${venv_name}/bin/pip", 'install', '-e', '.'
 }
 
@@ -24,6 +28,7 @@ task codegen(type: Exec, dependsOn: [environmentSetup, installPackage, ':metadat
 }
 
 task install(dependsOn: [installPackage, codegen])
+
 
 task installDev(type: Exec, dependsOn: [install]) {
   commandLine "${venv_name}/bin/pip", 'install', '-e', '.[dev]'
