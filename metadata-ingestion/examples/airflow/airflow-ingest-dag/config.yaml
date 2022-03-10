@@ -1,0 +1,12 @@
+#The id of the airflow connection which points to datahub gms
+datahub_conn_id: datahub
+
+#Name of the cluster you want to see the ingested Airflow data on Datahub
+cluster: PROD
+
+#Should it capture ownership info based on the Airflow dag/task ownership
+capture_ownership_info: true
+
+#Should it capture tags info based on the Airflow dag/task tags
+capture_tags_info: true
+
