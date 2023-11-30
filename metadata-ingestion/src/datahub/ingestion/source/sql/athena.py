@@ -269,7 +269,7 @@ class AthenaConfig(SQLCommonConfig):
     )
 
     include_table_lineage = pydantic.Field(
-        default=True,
+        default=False,
         description="Whether to include table lineage in the ingestion. "
         "This requires to have the table lineage feature enabled.",
     )
@@ -541,6 +541,10 @@ class AthenaSource(SQLAlchemySource):
             )
             for qe in qe_response["QueryExecutions"]:
                 if qe["Status"]["State"] == "SUCCEEDED":
+                    self.report.num_queries_parsed += 1
+                    if self.report.num_queries_parsed % 50 == 0:
+                        logger.info(f"Parsed {self.report.num_queries_parsed} queries")
+
                     yield from self.gen_lineage_from_query(
                         query=qe["Query"],
                         default_database=qe["QueryExecutionContext"]["Database"],
@@ -555,19 +559,6 @@ class AthenaSource(SQLAlchemySource):
                 response = client.list_query_executions(
                     MaxResults=50, NextToken=response.get("NextToken")
                 )
-
-        # for entry in engine.execute(self._make_lineage_query()):
-        #    self.report.num_queries_parsed += 1
-        #    if self.report.num_queries_parsed % 1000 == 0:
-        #        logger.info(f"Parsed {self.report.num_queries_parsed} queries")
-
-        #    yield from self.gen_lineage_from_query(
-        #        query=entry.query_text,
-        #        default_database=entry.default_database,
-        #        timestamp=entry.timestamp,
-        #        user=entry.user,
-        #        urns=urns,
-        #    )
 
     def gen_lineage_from_query(
         self,
