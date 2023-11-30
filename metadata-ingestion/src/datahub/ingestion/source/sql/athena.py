@@ -530,7 +530,10 @@ class AthenaSource(SQLAlchemySource):
         client = self.config.aws_config.get_athena_client()
         ids = []
         response = client.list_query_executions(MaxResults=50)
-        while response.get("NextToken"):
+        process_more = False
+        if response["QueryExecutionIds"]:
+            process_more = True
+        while process_more:
             ids.extend(response["QueryExecutionIds"])
             logger.info(f"Retrieved {len(ids)} query execution ids")
             qe_response = client.batch_get_query_execution(
@@ -545,9 +548,13 @@ class AthenaSource(SQLAlchemySource):
                         user="random_user",
                         urns=urns,
                     )
-            response = client.list_query_executions(
-                MaxResults=50, NextToken=response.get("NextToken")
-            )
+
+            if response.get("NextToken") is None:
+                process_more = False
+            else:
+                response = client.list_query_executions(
+                    MaxResults=50, NextToken=response.get("NextToken")
+                )
 
         # for entry in engine.execute(self._make_lineage_query()):
         #    self.report.num_queries_parsed += 1
