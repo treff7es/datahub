@@ -214,6 +214,9 @@ class AwsConnectionConfig(ConfigModel):
     def get_glue_client(self) -> "GlueClient":
         return self.get_session().client("glue", config=self._aws_config())
 
+    def get_athena_client(self) -> "AthenaClient":
+        return self.get_session().client("athena", config=self._aws_config())
+
     def get_sagemaker_client(self) -> "SageMakerClient":
         return self.get_session().client("sagemaker", config=self._aws_config())
 

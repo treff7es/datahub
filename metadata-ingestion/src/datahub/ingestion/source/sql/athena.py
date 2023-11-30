@@ -2,7 +2,9 @@ import json
 import logging
 import re
 import typing
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast
+from builtins import RuntimeError
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast, Set
 
 import pydantic
 from pyathena.common import BaseCursor
@@ -16,6 +18,7 @@ from sqlalchemy_bigquery import STRUCT
 
 from datahub.configuration.validate_field_rename import pydantic_renamed_field
 from datahub.emitter.mcp_builder import ContainerKey, DatabaseKey
+from datahub.emitter.sql_parsing_builder import SqlParsingBuilder
 from datahub.ingestion.api.decorators import (
     SourceCapability,
     SupportStatus,
@@ -24,19 +27,28 @@ from datahub.ingestion.api.decorators import (
     platform_name,
     support_status,
 )
+from datahub.ingestion.api.source_helpers import auto_lowercase_urns
 from datahub.ingestion.api.workunit import MetadataWorkUnit
+from datahub.ingestion.source.aws.aws_common import AwsSourceConfig, AwsConnectionConfig
 from datahub.ingestion.source.aws.s3_util import make_s3_urn
 from datahub.ingestion.source.common.subtypes import DatasetContainerSubTypes
 from datahub.ingestion.source.sql.sql_common import (
     SQLAlchemySource,
     register_custom_type,
+    SqlWorkUnit,
+    SQLSourceReport,
 )
 from datahub.ingestion.source.sql.sql_config import SQLCommonConfig, make_sqlalchemy_uri
+from datahub.ingestion.source.sql.sql_generic_profiler import ProfilingSqlReport
 from datahub.ingestion.source.sql.sql_utils import (
     add_table_to_schema_container,
     gen_database_container,
     gen_database_key,
 )
+from datahub.ingestion.source.usage.usage_common import BaseUsageConfig
+from datahub.ingestion.source_report.ingestion_stage import IngestionStageReport
+from datahub.ingestion.source_report.time_window import BaseTimeWindowReport
+from datahub.metadata._schema_classes import SchemaMetadataClass
 from datahub.metadata.com.linkedin.pegasus2avro.schema import SchemaField
 from datahub.metadata.schema_classes import MapTypeClass, RecordTypeClass
 from datahub.utilities.hive_schema_to_avro import get_avro_schema_for_hive_column
@@ -44,6 +56,7 @@ from datahub.utilities.sqlalchemy_type_converter import (
     MapType,
     get_schema_fields_for_sqlalchemy_column,
 )
+from datahub.utilities.sqlglot_lineage import sqlglot_lineage
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +223,10 @@ class CustomAthenaRestDialect(AthenaRestDialect):
 
 
 class AthenaConfig(SQLCommonConfig):
+    aws_config: Optional[AwsConnectionConfig] = pydantic.Field(
+        default=None, description="AWS configuration"
+    )
+
     scheme: str = "awsathena+rest"
     username: Optional[str] = pydantic.Field(
         default=None,
@@ -251,6 +268,25 @@ class AthenaConfig(SQLCommonConfig):
         "queries executed by DataHub."
     )
 
+    include_table_lineage = pydantic.Field(
+        default=True,
+        description="Whether to include table lineage in the ingestion. "
+        "This requires to have the table lineage feature enabled.",
+    )
+    include_view_lineage = pydantic.Field(
+        default=True,
+        description="Whether to include view lineage in the ingestion. "
+        "This requires to have the view lineage feature enabled.",
+    )
+    usage: BaseUsageConfig = pydantic.Field(
+        description="The usage config to use when generating usage statistics",
+        default=BaseUsageConfig(),
+    )
+    include_usage_statistics: bool = pydantic.Field(
+        default=False,
+        description="Generate usage statistic.",
+    )
+
     # overwrite default behavior of SQLAlchemyConfing
     include_views: Optional[bool] = pydantic.Field(
         default=True, description="Whether views should be ingested."
@@ -280,6 +316,12 @@ class AthenaConfig(SQLCommonConfig):
         )
 
 
+class AthenaReport(SQLSourceReport, BaseTimeWindowReport):
+    num_queries_parsed: int = 0
+    num_view_ddl_parsed: int = 0
+    num_table_parse_failures: int = 0
+
+
 @platform_name("Athena")
 @support_status(SupportStatus.CERTIFIED)
 @config_class(AthenaConfig)
@@ -299,13 +341,20 @@ class AthenaSource(SQLAlchemySource):
     - Profiling when enabled.
     """
 
-    def __init__(self, config, ctx):
+    def __init__(self, config: AthenaConfig, ctx):
         super().__init__(config, ctx, "athena")
+        self.report: AthenaReport = AthenaReport()
         self.cursor: Optional[BaseCursor] = None
 
     @classmethod
     def create(cls, config_dict, ctx):
         config = AthenaConfig.parse_obj(config_dict)
+        cls.builder: SqlParsingBuilder = SqlParsingBuilder(
+            usage_config=config.usage if config.include_usage_statistics else None,
+            generate_lineage=True,
+            generate_usage_statistics=config.include_usage_statistics,
+            generate_operations=config.usage.include_operational_stats,
+        )
         return cls(config, ctx)
 
     # overwrite this method to allow to specify the usage of a custom dialect
@@ -457,6 +506,94 @@ class AthenaSource(SQLAlchemySource):
         )
 
         return fields
+
+    def get_workunits_internal(self) -> Iterable[Union[MetadataWorkUnit, SqlWorkUnit]]:
+        # Add all schemas to the schema resolver
+        # Sql parser operates on lowercase urns so we need to lowercase the urns
+        for wu in auto_lowercase_urns(super().get_workunits_internal()):
+            urn = wu.get_urn()
+            schema_metadata = wu.get_aspect_of_type(SchemaMetadataClass)
+            if schema_metadata:
+                self.schema_resolver.add_schema_metadata(urn, schema_metadata)
+            yield wu
+
+        urns = self.schema_resolver.get_urns()
+        if self.config.include_table_lineage or self.config.include_usage_statistics:
+            # self.report.report_ingestion_stage_start("audit log extraction")
+            yield from self.get_audit_log_mcps(urns=urns)
+
+        yield from self.builder.gen_workunits()
+
+    def get_audit_log_mcps(self, urns: Set[str]) -> Iterable[MetadataWorkUnit]:
+        if not self.config.aws_config:
+            raise RuntimeError("AWS config is required for audit log extraction")
+        client = self.config.aws_config.get_athena_client()
+        ids = []
+        response = client.list_query_executions(MaxResults=50)
+        while response.get("NextToken"):
+            ids.extend(response["QueryExecutionIds"])
+            logger.info(f"Retrieved {len(ids)} query execution ids")
+            qe_response = client.batch_get_query_execution(
+                QueryExecutionIds=response["QueryExecutionIds"]
+            )
+            for qe in qe_response["QueryExecutions"]:
+                if qe["Status"]["State"] == "SUCCEEDED":
+                    yield from self.gen_lineage_from_query(
+                        query=qe["Query"],
+                        default_database=qe["QueryExecutionContext"]["Database"],
+                        timestamp=qe["Status"]["SubmissionDateTime"],
+                        user="random_user",
+                        urns=urns,
+                    )
+            response = client.list_query_executions(
+                MaxResults=50, NextToken=response.get("NextToken")
+            )
+
+        # for entry in engine.execute(self._make_lineage_query()):
+        #    self.report.num_queries_parsed += 1
+        #    if self.report.num_queries_parsed % 1000 == 0:
+        #        logger.info(f"Parsed {self.report.num_queries_parsed} queries")
+
+        #    yield from self.gen_lineage_from_query(
+        #        query=entry.query_text,
+        #        default_database=entry.default_database,
+        #        timestamp=entry.timestamp,
+        #        user=entry.user,
+        #        urns=urns,
+        #    )
+
+    def gen_lineage_from_query(
+        self,
+        query: str,
+        default_database: Optional[str] = None,
+        timestamp: Optional[datetime] = None,
+        user: Optional[str] = None,
+        view_urn: Optional[str] = None,
+        urns: Optional[Set[str]] = None,
+    ) -> Iterable[MetadataWorkUnit]:
+        result = sqlglot_lineage(
+            # With this clever hack we can make the query parser to not fail on queries with CASESPECIFIC
+            sql=query,
+            schema_resolver=self.schema_resolver,
+            default_db=None,
+            default_schema=default_database
+            if default_database
+            else self.config.default_db,
+        )
+        if result.debug_info.table_error:
+            logger.debug(
+                f"Error parsing table lineage ({view_urn}):\n{result.debug_info.table_error}"
+            )
+            self.report.num_table_parse_failures += 1
+        else:
+            yield from self.builder.process_sql_parsing_result(
+                result,
+                query=query,
+                is_view_ddl=view_urn is not None,
+                query_timestamp=timestamp,
+                user=f"urn:li:corpuser:{user}",
+                include_urns=urns,
+            )
 
     def close(self):
         if self.cursor:
