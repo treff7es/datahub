@@ -1,3 +1,8 @@
+import sys
+
+if sys.version_info < (3, 8):
+    raise ImportError("Mssql is only supported on Python 3.8+")
+
 import logging
 import re
 import urllib.parse
